@@ -6,6 +6,14 @@ import (
 	"github.com/sony/sonyflake"
 )
 
+type ChannelType string
+
+const (
+	ChannelEmail ChannelType = "email"
+	ChannelSMS   ChannelType = "sms"
+	ChannelPush  ChannelType = "push"
+)
+
 type Config struct {
 	MachineID uint16
 }
@@ -13,14 +21,14 @@ type Config struct {
 type NotificationEvent[T any] struct {
 	// Identity & Routing (Infrastructure)
 	EventID   uint64            `json:"event_id"`
-	Channel   string            `json:"channel"`
+	Channel   ChannelType            `json:"channel"`
 	CreatedAt time.Time         `json:"created_at"`
 	Attempt   int               `json:"attempt"`
 	Metadata  map[string]string `json:"metadata"`
 	Payload   T                 `json:"payload"`
 }
 
-func newNotificationEvent[T any](id uint64, channel string, payload T) NotificationEvent[T] {
+func newNotificationEvent[T any](id uint64, channel ChannelType, payload T) NotificationEvent[T] {
 
 	return NotificationEvent[T]{
 		EventID:   id,
@@ -48,7 +56,7 @@ func NewManager[T any](cfg Config) *Manager[T] {
 	}
 }
 
-func (m *Manager[T]) CreateEvent(channel string, payload T) (NotificationEvent[T], error) {
+func (m *Manager[T]) CreateEvent(channel ChannelType, payload T) (NotificationEvent[T], error) {
 	id, err := m.flake.NextID()
 	if err != nil {
 		return NotificationEvent[T]{}, err
