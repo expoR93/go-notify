@@ -14,6 +14,22 @@ const (
 	ChannelPush  ChannelType = "push"
 )
 
+type ErrorType int
+
+const (
+	ErrorTransient ErrorType = iota
+	ErrorPermanent
+)
+
+type ProviderError struct {
+	Err error
+	Type ErrorType
+}
+
+func (e *ProviderError) Error() string {
+	return e.Err.Error()
+}
+
 type Config struct {
 	MachineID uint16
 }
