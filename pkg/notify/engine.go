@@ -14,14 +14,15 @@ import (
 const MaxRetries = 5
 
 type Engine[T any] struct {
-	driver      Driver[T]
-	providers   map[string]Provider[T]
-	workerCount int
-	startTime   time.Time
-	logger      *slog.Logger
+	driver         Driver[T]
+	providers      map[string]Provider[T]
+	workerCount    int
+	startTime      time.Time
+	logger         *slog.Logger
+	deadLetterHook DeadLetterHook[T]
 }
 
-func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int, logger *slog.Logger) (*Engine[T], error) {
+func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int, logger *slog.Logger, dlh DeadLetterHook[T]) (*Engine[T], error) {
 	if driver == nil {
 		return nil, errors.New("Expected a driver, found none")
 	}
@@ -50,10 +51,11 @@ func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int
 	}
 
 	return &Engine[T]{
-		driver:      driver,
-		providers:   registry,
-		workerCount: workerCount,
-		logger:      logger,
+		driver:         driver,
+		providers:      registry,
+		workerCount:    workerCount,
+		logger:         logger,
+		deadLetterHook: dlh,
 	}, nil
 }
 
@@ -91,11 +93,16 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 
 func (e *Engine[T]) processEvent(event NotificationEvent[T]) {
 	if event.Attempt > MaxRetries {
-		// Here we would trigger a DLQ (Dead Letter Queue) move
-		// For now, we log it and Ack to kill the infinite loop
 		e.logger.Warn("max retries reached",
 			slog.Uint64("event_id", event.EventID),
 			slog.Int("attempts", event.Attempt))
+
+		if e.deadLetterHook != nil {
+			// Persist the failure before we Ack
+			if err := e.deadLetterHook.Handle(event, errors.New("max retries exceeded")); err != nil {
+				e.logger.Error("failed to execute dead letter hook", slog.String("error", err.Error()))
+			}
+		}
 		e.driver.Ack(event.EventID)
 		return
 	}

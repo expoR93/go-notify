@@ -15,3 +15,7 @@ type Provider[T any] interface {
 	Send(event NotificationEvent[T]) error
 	Type() string // "email", "sms"...
 }
+
+type DeadLetterHook[T any] interface {
+	Handle(event NotificationEvent[T], finalErr error) error
+}
