@@ -4,6 +4,7 @@ import (
 	// "fmt"
 	"context"
 	"errors"
+	"log/slog"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -17,10 +18,10 @@ type Engine[T any] struct {
 	providers   map[string]Provider[T]
 	workerCount int
 	startTime   time.Time
-	// wg          sync.WaitGroup
+	logger      *slog.Logger
 }
 
-func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int) (*Engine[T], error) {
+func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int, logger *slog.Logger) (*Engine[T], error) {
 	if driver == nil {
 		return nil, errors.New("Expected a driver, found none")
 	}
@@ -44,10 +45,15 @@ func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int
 		}
 	}
 
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &Engine[T]{
 		driver:      driver,
 		providers:   registry,
 		workerCount: workerCount,
+		logger:      logger,
 	}, nil
 }
 
@@ -87,7 +93,9 @@ func (e *Engine[T]) processEvent(event NotificationEvent[T]) {
 	if event.Attempt > MaxRetries {
 		// Here we would trigger a DLQ (Dead Letter Queue) move
 		// For now, we log it and Ack to kill the infinite loop
-		// e.logger.Warn("Max retries reached", "event_id", event.EventID)
+		e.logger.Warn("max retries reached",
+			slog.Uint64("event_id", event.EventID),
+			slog.Int("attempts", event.Attempt))
 		e.driver.Ack(event.EventID)
 		return
 	}
@@ -96,29 +104,51 @@ func (e *Engine[T]) processEvent(event NotificationEvent[T]) {
 
 	provider, exists := e.providers[targetChannel]
 	if !exists {
-		// Before Ack here we'll implement a loggin fuctionality
-		// to tell the user that the provider doesn't exists.
-		// In such case no Retry should be performed.
+		e.logger.Error("routing failed: no provider registered for channel",
+			slog.String("channel", targetChannel),
+			slog.Uint64("event_id", event.EventID),
+			slog.String("suggestion", "check NewEngine provider slice initialization"),
+		)
 		e.driver.Ack(event.EventID)
 		return
 	}
 
 	if err := provider.Send(event); err != nil {
 		var provErr *ProviderError
+
+		// Handle Permanent Failures (Invalid API Key, Bad Request, etc.)
 		if errors.As(err, &provErr) && provErr.Type == ErrorPermanent {
-			// Log the permanent failure and Ack to remove it from the queue
-			// e.logger.Error("Permanent failure", "event", event.EventID)
+			e.logger.Error("permanent provider failure: dropping message",
+				slog.Uint64("event_id", event.EventID),
+				slog.String("channel", string(event.Channel)),
+				slog.String("error", err.Error()),
+			)
 			e.driver.Ack(event.EventID)
 			return
 		}
-		// Add a random 0-100ms to the delay
+
+		// Handle Transient Failures (Network timeout, 500 Internal Error, etc.)
 		jitter := time.Duration(rand.Intn(100)) * time.Millisecond
 		delay := e.calculateBackoff(event.Attempt) + jitter
+
 		event.Attempt++
-		// Log: "Send failed: %v. Retrying (Attempt %d)", err, event.Attempt
+
+		e.logger.Warn("transient provider failure: scheduling retry",
+			slog.Uint64("event_id", event.EventID),
+			slog.Int("attempt", event.Attempt),
+			slog.Duration("backoff_delay", delay),
+			slog.String("error", err.Error()),
+		)
+
 		e.driver.Nack(event, delay)
 		return
 	}
+
+	e.logger.Info("notification sent successfully",
+		slog.Uint64("event_id", event.EventID),
+		slog.String("channel", string(event.Channel)),
+		slog.Duration("duration", time.Since(event.CreatedAt)), // Performance metric!
+	)
 
 	e.driver.Ack(event.EventID)
 }
