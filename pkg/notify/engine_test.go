@@ -239,3 +239,70 @@ func TestEngine(t *testing.T) {
 		})
 	}
 }
+
+func TestEngine_GracefulShutdown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	inputEvent := NotificationEvent[TestPayload]{
+		EventID:   1,
+		Channel:   ChannelEmail,
+		CreatedAt: time.Now(),
+		Attempt:   1,
+	}
+
+	testCh := make(chan NotificationEvent[TestPayload], 1)
+	startedProcessing := make(chan struct{})
+
+	driver := &MockDriver[TestPayload]{
+		ListenFunc: func(ctx context.Context) (<-chan NotificationEvent[TestPayload], error) {
+			var once sync.Once
+			go func() {
+				<-ctx.Done()
+				once.Do(func() { close(testCh) })
+			}()
+			return testCh, nil
+		},
+	}
+
+	providers := []Provider[TestPayload]{
+		&MockProvider[TestPayload]{
+			SendFunc: func(ev NotificationEvent[TestPayload]) error {
+				startedProcessing <- struct{}{}
+				time.Sleep(500 * time.Millisecond)
+				return nil
+			},
+			TypeFunc: func() string { return string(ChannelEmail) },
+		},
+	}
+
+	dlh := &MockDeadLetter[TestPayload]{
+		HandleFunc: func(ev NotificationEvent[TestPayload], finalErr error) error {
+			return finalErr
+		},
+	}
+
+	engine, err := NewEngine(driver, providers, 0, nil, dlh)
+	if err != nil {
+		t.Errorf("Error initializing the Engine: %v", err)
+	}
+
+	engineErrors := make(chan error, 1)
+	go func() {
+		engineErrors <- engine.Start(ctx)
+	}()
+
+	testCh <- inputEvent
+
+	<-startedProcessing
+
+	cancel()
+
+	if err := <-engineErrors; err != nil {
+		t.Error("Expected a graceful shutdown, the engine crashed instead")
+	}
+
+	if driver.AckCalls != 1 {
+		t.Errorf("Expected AckCalls to be 1, got %v instead", driver.AckCalls)
+	}
+}

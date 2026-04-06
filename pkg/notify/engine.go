@@ -72,21 +72,15 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case event, ok := <-events:
-					if !ok {
-						return
-					}
-					e.processEvent(event)
-				}
+			for event := range events {
+				e.processEvent(event)
 			}
 		}()
 	}
 
 	wg.Wait()
+
+	e.logger.Info("engine stopped gracefully")
 
 	return nil
 }
