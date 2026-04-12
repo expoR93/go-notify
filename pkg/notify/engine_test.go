@@ -100,6 +100,15 @@ func TestEngine(t *testing.T) {
 		expectedDLQ  bool
 	}{
 		{
+			name: "Validation Failure - Drop Poison Pill",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID: 0,
+			},
+			providerErr: nil,
+			expectedAck: true,
+			expectedDLQ: false,
+		},
+		{
 			name: "Routing Success",
 			inputEvent: NotificationEvent[TestPayload]{
 				EventID:   1,

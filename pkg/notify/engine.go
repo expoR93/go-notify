@@ -86,6 +86,15 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 }
 
 func (e *Engine[T]) processEvent(event NotificationEvent[T]) {
+	if err := event.Validate(); err != nil {
+		e.logger.Error("notification_event validation failed",
+			slog.Uint64("event_id", event.EventID),
+			slog.String("error", err.Error()),
+		)
+		e.driver.Ack(event.EventID)
+		return
+	}
+
 	if event.Attempt > MaxRetries {
 		e.logger.Warn("max retries reached",
 			slog.Uint64("event_id", event.EventID),
