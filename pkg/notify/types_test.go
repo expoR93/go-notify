@@ -2,6 +2,7 @@ package notify
 
 import (
 	"testing"
+	"time"
 	// "github.com/sony/sonyflake"
 )
 
@@ -44,5 +45,98 @@ func TestManagerCreateEvent(t *testing.T) {
 
 	if events[0].EventID == events[1].EventID {
 		t.Error("Expected different event IDs")
+	}
+}
+
+func TestValidateEvent(t *testing.T) {
+	testCases := []struct {
+		name          string
+		inputEvent    NotificationEvent[TestPayload]
+		expectedError string
+	}{
+		{
+			name: "EventID validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID: 0,
+			},
+			expectedError: "event_id cannot be zero",
+		},
+		{
+			name: "Attempt validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID: 1,
+				Attempt: 0,
+			},
+			expectedError: "event_attempt cannot be zero",
+		},
+		{
+			name: "Channel validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID: 2,
+				Attempt: 1,
+				Channel: "",
+			},
+			expectedError: "event_channel cannot be empty",
+		},
+		{
+			name: "CreatedAt.After() validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID:   3,
+				Attempt:   2,
+				Channel:   ChannelEmail,
+				CreatedAt: time.Now().Add(10 * time.Second),
+			},
+			expectedError: "event_createdat cannot be further in the future (5s+), potential serialization error or a severely de-synchronized clock",
+		},
+		{
+			name: "CreatedAt.Before() validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID:   4,
+				Attempt:   3,
+				Channel:   ChannelEmail,
+				CreatedAt: time.Now().AddDate(0, 0, -8),
+			},
+			expectedError: "event_createdat cannot be a week old",
+		},
+		{
+			name: "CreatedAt.IsZero() validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID:   5,
+				Attempt:   4,
+				Channel:   ChannelEmail,
+				CreatedAt: time.Time{},
+			},
+			expectedError: "event_createdat cannot be zero",
+		},
+		{
+			name: "Successful validation",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID:   100,
+				Attempt:   1,
+				Channel:   ChannelEmail,
+				CreatedAt: time.Now(),
+			},
+			expectedError: "", // No error expected
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.inputEvent.Validate()
+
+			if tc.expectedError != "" && err == nil {
+				t.Errorf("expected error %q, but got nil", tc.expectedError)
+				return
+			}
+
+			if tc.expectedError == "" && err != nil {
+				t.Errorf("expected success, but got error: %v", err)
+				return
+			}
+
+			if err != nil && err.Error() != tc.expectedError {
+				t.Errorf("expected error %q, but got %q", tc.expectedError, err.Error())
+			}
+		})
 	}
 }
