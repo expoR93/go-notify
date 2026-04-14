@@ -9,13 +9,13 @@ import (
 )
 
 type MockProvider[T any] struct {
-	SendFunc func(event NotificationEvent[T]) error
+	SendFunc func(ctx context.Context, event NotificationEvent[T]) error
 	TypeFunc func() string
 }
 
-func (m *MockProvider[T]) Send(event NotificationEvent[T]) error {
+func (m *MockProvider[T]) Send(ctx context.Context, event NotificationEvent[T]) error {
 	if m.SendFunc != nil {
-		return m.SendFunc(event)
+		return m.SendFunc(ctx, event)
 	}
 
 	return nil // Default success
@@ -170,6 +170,18 @@ func TestEngine(t *testing.T) {
 			expectedAck: true,
 			expectedDLQ: true,
 		},
+		{
+			name: "Provider Timeout - Trigger Transient Retry",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID:   7,
+				Channel:   ChannelEmail,
+				CreatedAt: time.Now(),
+				Attempt:   1,
+			},
+			providerErr:  context.DeadlineExceeded,
+			expectedNack: true,
+			expectedAck:  false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -190,7 +202,7 @@ func TestEngine(t *testing.T) {
 
 			providers := []Provider[TestPayload]{
 				&MockProvider[TestPayload]{
-					SendFunc: func(ev NotificationEvent[TestPayload]) error {
+					SendFunc: func(ctx context.Context, ev NotificationEvent[TestPayload]) error {
 						return tc.providerErr
 					},
 					TypeFunc: func() string { return string(ChannelEmail) },
@@ -276,7 +288,7 @@ func TestEngine_GracefulShutdown(t *testing.T) {
 
 	providers := []Provider[TestPayload]{
 		&MockProvider[TestPayload]{
-			SendFunc: func(ev NotificationEvent[TestPayload]) error {
+			SendFunc: func(ctx context.Context, ev NotificationEvent[TestPayload]) error {
 				startedProcessing <- struct{}{}
 				time.Sleep(500 * time.Millisecond)
 				return nil

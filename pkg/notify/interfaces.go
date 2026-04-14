@@ -12,7 +12,7 @@ type Driver[T any] interface {
 }
 
 type Provider[T any] interface {
-	Send(event NotificationEvent[T]) error
+	Send(ctx context.Context, event NotificationEvent[T]) error
 	Type() string // "email", "sms"...
 }
 

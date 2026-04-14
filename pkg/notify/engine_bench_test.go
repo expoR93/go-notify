@@ -2,6 +2,8 @@ package notify
 
 import (
 	"context"
+	"time"
+
 	// "sync"
 	"testing"
 )
@@ -21,7 +23,7 @@ func BenchmarkEngineProcessing(b *testing.B) {
 
 	providers := []Provider[TestPayload]{
 		&MockProvider[TestPayload]{
-			SendFunc: func(ev NotificationEvent[TestPayload]) error { return nil },
+			SendFunc: func(ctx context.Context, ev NotificationEvent[TestPayload]) error { return nil },
 			TypeFunc: func() string { return string(ChannelEmail) },
 		},
 	}
@@ -31,8 +33,10 @@ func BenchmarkEngineProcessing(b *testing.B) {
 	go engine.Start(ctx)
 
 	event := NotificationEvent[TestPayload]{
-		EventID: 1,
-		Channel: ChannelEmail,
+		EventID:   1,
+		Channel:   ChannelEmail,
+		Attempt:   1,
+		CreatedAt: time.Now(),
 	}
 
 	b.ResetTimer() // Don't count setup time

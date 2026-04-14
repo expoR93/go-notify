@@ -73,7 +73,7 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			for event := range events {
-				e.processEvent(event)
+				e.processEvent(ctx, event)
 			}
 		}()
 	}
@@ -85,7 +85,7 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine[T]) processEvent(event NotificationEvent[T]) {
+func (e *Engine[T]) processEvent(ctx context.Context, event NotificationEvent[T]) {
 	if err := event.Validate(); err != nil {
 		e.logger.Error("notification_event validation failed",
 			slog.Uint64("event_id", event.EventID),
@@ -123,7 +123,7 @@ func (e *Engine[T]) processEvent(event NotificationEvent[T]) {
 		return
 	}
 
-	if err := provider.Send(event); err != nil {
+	if err := provider.Send(ctx, event); err != nil {
 		var provErr *ProviderError
 
 		// Handle Permanent Failures (Invalid API Key, Bad Request, etc.)
