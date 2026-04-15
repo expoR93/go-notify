@@ -327,3 +327,35 @@ func TestEngine_GracefulShutdown(t *testing.T) {
 		t.Errorf("Expected AckCalls to be 1, got %v instead", driver.AckCalls)
 	}
 }
+
+func TestEngine_DriverReconnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reconnectSignal := make(chan struct{}, 1)
+	testCh := make(chan NotificationEvent[TestPayload], 1)
+
+	callCount := 0
+	driver := &MockDriver[TestPayload]{
+		ListenFunc: func(ctx context.Context) (<-chan NotificationEvent[TestPayload], error) {
+			callCount++
+			if callCount == 1 {
+				return nil, fmt.Errorf("initial connection failure")
+			}
+
+			reconnectSignal <- struct{}{}
+			return testCh, nil
+		},
+	}
+
+	engine, _ := NewEngine(driver, []Provider[TestPayload]{&MockProvider[TestPayload]{}}, 1, nil, nil)
+
+	go engine.Start(ctx)
+
+	select {
+	case <-reconnectSignal:
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine failed to reconnect after initial driver error")
+	}
+}

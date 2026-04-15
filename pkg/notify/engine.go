@@ -61,28 +61,59 @@ func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int
 
 func (e *Engine[T]) Start(ctx context.Context) error {
 	e.startTime = time.Now()
+	reconnectAttempt := 0
 
-	events, err := e.driver.Listen(ctx)
-	if err != nil {
-		return err
-	}
+	for {
+		events, err := e.driver.Listen(ctx)
+		if err != nil {
+			reconnectAttempt++
 
-	var wg sync.WaitGroup
-	for i := 0; i < e.workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for event := range events {
-				e.processEvent(ctx, event)
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil
 			}
-		}()
+
+			delay := e.calculateBackoff(reconnectAttempt)
+			e.logger.Error("driver connection failed, retrying",
+				slog.Int("attempt", reconnectAttempt),
+				slog.Duration("retry_in", delay),
+				slog.String("error", err.Error()),
+			)
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(delay):
+				continue
+			}
+		}
+
+		reconnectAttempt = 0
+
+		e.logger.Info("driver connection established, spawning workers",
+			slog.Int("count", e.workerCount),
+		)
+
+		var wg sync.WaitGroup
+		for i := 0; i < e.workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for event := range events {
+					e.processEvent(ctx, event)
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		select {
+		case <-ctx.Done():
+			e.logger.Info("engine stopped gracefully")
+			return nil
+		default:
+			e.logger.Warn("driver connection lost, entering reconnection loop")
+		}
 	}
-
-	wg.Wait()
-
-	e.logger.Info("engine stopped gracefully")
-
-	return nil
 }
 
 func (e *Engine[T]) processEvent(ctx context.Context, event NotificationEvent[T]) {
