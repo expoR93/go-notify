@@ -50,6 +50,7 @@ type NotificationEvent[T any] struct {
 	EventID   uint64            `json:"event_id"`
 	Channel   ChannelType       `json:"channel"`
 	CreatedAt time.Time         `json:"created_at"`
+	ExpiresAt time.Time         `json:"expires_at,omitempty"`
 	Attempt   int               `json:"attempt"`
 	Metadata  map[string]string `json:"metadata"`
 	Payload   T                 `json:"payload"`
@@ -86,14 +87,15 @@ func (e *NotificationEvent[T]) Validate() error {
 			Type: ErrorInvalidData,
 		}
 	}
-	if e.CreatedAt.Before(time.Now().AddDate(0, 0, -7)) {
-		return &ValidationError{
-			Err:  errors.New("event_createdat cannot be a week old"),
-			Type: ErrorInvalidData,
-		}
-	}
 
 	return nil
+}
+
+func (e *NotificationEvent[T]) IsExpired() bool {
+	if e.ExpiresAt.IsZero() {
+		return false // Never expires by default
+	}
+	return time.Now().After(e.ExpiresAt)
 }
 
 func newNotificationEvent[T any](id uint64, channel ChannelType, payload T) NotificationEvent[T] {
@@ -103,7 +105,7 @@ func newNotificationEvent[T any](id uint64, channel ChannelType, payload T) Noti
 		Channel:   channel,
 		CreatedAt: time.Now(),
 		Attempt:   1,
-		Metadata:  make(map[string]string),
+		Metadata:  nil,
 		Payload:   payload,
 	}
 }

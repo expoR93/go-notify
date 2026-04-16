@@ -89,16 +89,6 @@ func TestValidateEvent(t *testing.T) {
 			expectedError: "event_createdat cannot be further in the future (5s+), potential serialization error or a severely de-synchronized clock",
 		},
 		{
-			name: "CreatedAt.Before() validation",
-			inputEvent: NotificationEvent[TestPayload]{
-				EventID:   4,
-				Attempt:   3,
-				Channel:   ChannelEmail,
-				CreatedAt: time.Now().AddDate(0, 0, -8),
-			},
-			expectedError: "event_createdat cannot be a week old",
-		},
-		{
 			name: "CreatedAt.IsZero() validation",
 			inputEvent: NotificationEvent[TestPayload]{
 				EventID:   5,
@@ -136,6 +126,44 @@ func TestValidateEvent(t *testing.T) {
 
 			if err != nil && err.Error() != tc.expectedError {
 				t.Errorf("expected error %q, but got %q", tc.expectedError, err.Error())
+			}
+		})
+	}
+}
+
+func TestIsExpired(t *testing.T) {
+	testCases := []struct {
+		name     string
+		event    NotificationEvent[TestPayload]
+		expected bool
+	}{
+		{
+			name: "Not expired (ExpiresAt is zero)",
+			event: NotificationEvent[TestPayload]{
+				ExpiresAt: time.Time{},
+			},
+			expected: false,
+		},
+		{
+			name: "Not expired (ExpiresAt in the future)",
+			event: NotificationEvent[TestPayload]{
+				ExpiresAt: time.Now().Add(1 * time.Hour),
+			},
+			expected: false,
+		},
+		{
+			name: "Expired (ExpiresAt in the past)",
+			event: NotificationEvent[TestPayload]{
+				ExpiresAt: time.Now().Add(-1 * time.Hour),
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.event.IsExpired() != tc.expected {
+				t.Errorf("expected IsExpired() to be %v, got %v", tc.expected, !tc.expected)
 			}
 		})
 	}

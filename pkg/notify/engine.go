@@ -13,6 +13,12 @@ import (
 
 const MaxRetries = 5
 
+var (
+	ErrEventExpired    = errors.New("notification expired")
+	ErrMaxRetries      = errors.New("max retries exceeded")
+	ErrProviderMissing = errors.New("no provider found for channel")
+)
+
 type Engine[T any] struct {
 	driver         Driver[T]
 	providers      map[string]Provider[T]
@@ -116,24 +122,45 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 	}
 }
 
-func (e *Engine[T]) processEvent(ctx context.Context, event NotificationEvent[T]) {
+func (e *Engine[T]) processEvent(ctx context.Context, event *NotificationEvent[T]) {
 	if err := event.Validate(); err != nil {
-		e.logger.Error("notification_event validation failed",
-			slog.Uint64("event_id", event.EventID),
-			slog.String("error", err.Error()),
-		)
+		if e.logger.Enabled(ctx, slog.LevelError) {
+			e.logger.Error("notification_event validation failed",
+				slog.Uint64("event_id", event.EventID),
+				slog.String("error", err.Error()),
+			)
+		}
+		e.driver.Ack(event.EventID)
+		return
+	}
+
+	if event.IsExpired() {
+		if e.logger.Enabled(ctx, slog.LevelWarn) {
+			e.logger.Warn("notification expired, routing to dead letter",
+				slog.Uint64("event_id", event.EventID),
+				slog.Time("expired_at", event.ExpiresAt),
+			)
+		}
+
+		if e.deadLetterHook != nil {
+			if err := e.deadLetterHook.Handle(event, ErrEventExpired); err != nil {
+				e.logger.Error("failed to execute dead letter hook for expired event", slog.String("error", err.Error()))
+			}
+		}
 		e.driver.Ack(event.EventID)
 		return
 	}
 
 	if event.Attempt > MaxRetries {
-		e.logger.Warn("max retries reached",
-			slog.Uint64("event_id", event.EventID),
-			slog.Int("attempts", event.Attempt))
+		if e.logger.Enabled(ctx, slog.LevelWarn) {
+			e.logger.Warn("max retries reached",
+				slog.Uint64("event_id", event.EventID),
+				slog.Int("attempts", event.Attempt))
+		}
 
 		if e.deadLetterHook != nil {
 			// Persist the failure before we Ack
-			if err := e.deadLetterHook.Handle(event, errors.New("max retries exceeded")); err != nil {
+			if err := e.deadLetterHook.Handle(event, ErrMaxRetries); err != nil {
 				e.logger.Error("failed to execute dead letter hook", slog.String("error", err.Error()))
 			}
 		}
@@ -145,11 +172,14 @@ func (e *Engine[T]) processEvent(ctx context.Context, event NotificationEvent[T]
 
 	provider, exists := e.providers[targetChannel]
 	if !exists {
-		e.logger.Error("routing failed: no provider registered for channel",
-			slog.String("channel", targetChannel),
-			slog.Uint64("event_id", event.EventID),
-			slog.String("suggestion", "check NewEngine provider slice initialization"),
-		)
+		if e.logger.Enabled(ctx, slog.LevelError) {
+			e.logger.Error("routing failed: no provider registered for channel",
+				slog.String("channel", targetChannel),
+				slog.Uint64("event_id", event.EventID),
+				slog.String("suggestion", "check NewEngine provider slice initialization"),
+			)
+		}
+
 		e.driver.Ack(event.EventID)
 		return
 	}
@@ -159,11 +189,14 @@ func (e *Engine[T]) processEvent(ctx context.Context, event NotificationEvent[T]
 
 		// Handle Permanent Failures (Invalid API Key, Bad Request, etc.)
 		if errors.As(err, &provErr) && provErr.Type == ErrorPermanent {
-			e.logger.Error("permanent provider failure: dropping message",
-				slog.Uint64("event_id", event.EventID),
-				slog.String("channel", string(event.Channel)),
-				slog.String("error", err.Error()),
-			)
+			if e.logger.Enabled(ctx, slog.LevelError) {
+				e.logger.Error("permanent provider failure: dropping message",
+					slog.Uint64("event_id", event.EventID),
+					slog.String("channel", string(event.Channel)),
+					slog.String("error", err.Error()),
+				)
+			}
+
 			e.driver.Ack(event.EventID)
 			return
 		}
@@ -174,22 +207,26 @@ func (e *Engine[T]) processEvent(ctx context.Context, event NotificationEvent[T]
 
 		event.Attempt++
 
-		e.logger.Warn("transient provider failure: scheduling retry",
-			slog.Uint64("event_id", event.EventID),
-			slog.Int("attempt", event.Attempt),
-			slog.Duration("backoff_delay", delay),
-			slog.String("error", err.Error()),
-		)
+		if e.logger.Enabled(ctx, slog.LevelWarn) {
+			e.logger.Warn("transient provider failure: scheduling retry",
+				slog.Uint64("event_id", event.EventID),
+				slog.Int("attempt", event.Attempt),
+				slog.Duration("backoff_delay", delay),
+				slog.String("error", err.Error()),
+			)
+		}
 
 		e.driver.Nack(event, delay)
 		return
 	}
 
-	e.logger.Info("notification sent successfully",
-		slog.Uint64("event_id", event.EventID),
-		slog.String("channel", string(event.Channel)),
-		slog.Duration("duration", time.Since(event.CreatedAt)), // Performance metric!
-	)
+	if e.logger.Enabled(ctx, slog.LevelInfo) {
+		e.logger.Info("notification sent successfully",
+			slog.Uint64("event_id", event.EventID),
+			slog.String("channel", string(event.Channel)),
+			slog.Duration("duration", time.Since(event.CreatedAt)), // Performance metric!
+		)
+	}
 
 	e.driver.Ack(event.EventID)
 }

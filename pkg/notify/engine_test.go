@@ -13,9 +13,9 @@ type MockProvider[T any] struct {
 	TypeFunc func() string
 }
 
-func (m *MockProvider[T]) Send(ctx context.Context, event NotificationEvent[T]) error {
+func (m *MockProvider[T]) Send(ctx context.Context, event *NotificationEvent[T]) error {
 	if m.SendFunc != nil {
-		return m.SendFunc(ctx, event)
+		return m.SendFunc(ctx, *event)
 	}
 
 	return nil // Default success
@@ -30,7 +30,7 @@ func (m *MockProvider[T]) Type() string {
 }
 
 type MockDriver[T any] struct {
-	ListenFunc func(ctx context.Context) (<-chan NotificationEvent[T], error)
+	ListenFunc func(ctx context.Context) (<-chan *NotificationEvent[T], error)
 	AckFunc    func(eventID uint64) error
 	NackFunc   func(event NotificationEvent[T], delay time.Duration) error
 	AckCalls   int
@@ -40,7 +40,7 @@ type MockDriver[T any] struct {
 	WG         *sync.WaitGroup
 }
 
-func (m *MockDriver[T]) Listen(ctx context.Context) (<-chan NotificationEvent[T], error) {
+func (m *MockDriver[T]) Listen(ctx context.Context) (<-chan *NotificationEvent[T], error) {
 	if m.ListenFunc != nil {
 		return m.ListenFunc(ctx)
 	}
@@ -61,11 +61,11 @@ func (m *MockDriver[T]) Ack(eventID uint64) error {
 	return nil
 }
 
-func (m *MockDriver[T]) Nack(event NotificationEvent[T], delay time.Duration) error {
+func (m *MockDriver[T]) Nack(event *NotificationEvent[T], delay time.Duration) error {
 	m.NackCalls++
 	m.LastNackID = event.EventID
 	if m.NackFunc != nil {
-		return m.NackFunc(event, delay)
+		return m.NackFunc(*event, delay)
 	}
 	if m.WG != nil {
 		m.WG.Done()
@@ -75,14 +75,16 @@ func (m *MockDriver[T]) Nack(event NotificationEvent[T], delay time.Duration) er
 }
 
 type MockDeadLetter[T any] struct {
-	HandleFunc func(event NotificationEvent[T], finalErr error) error
-	DLQ        []NotificationEvent[T]
+	HandleFunc func(event *NotificationEvent[T], finalErr error) error
+	DLQ        []*NotificationEvent[T]
 	DLQCall    int
 }
 
-func (dl *MockDeadLetter[T]) Handle(event NotificationEvent[T], finalErr error) error {
+func (dl *MockDeadLetter[T]) Handle(event *NotificationEvent[T], finalErr error) error {
 	dl.DLQCall++
-	dl.DLQ = append(dl.DLQ, event)
+	if len(dl.DLQ) < 1000 {
+		dl.DLQ = append(dl.DLQ, event)
+	}
 	if dl.HandleFunc != nil {
 		return dl.HandleFunc(event, finalErr)
 	}
@@ -182,6 +184,19 @@ func TestEngine(t *testing.T) {
 			expectedNack: true,
 			expectedAck:  false,
 		},
+		{
+			name: "Expired Event - Route to History/DLQ",
+			inputEvent: NotificationEvent[TestPayload]{
+				EventID:   8,
+				Channel:   ChannelEmail,
+				CreatedAt: time.Now().Add(-2 * time.Hour),
+				ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired 1 hour ago
+				Attempt:   1,
+			},
+			providerErr: nil,
+			expectedAck: true, // Must Ack to remove from queue
+			expectedDLQ: true, // Must reach DLQ for "History" tracking
+		},
 	}
 
 	for _, tc := range testCases {
@@ -191,11 +206,11 @@ func TestEngine(t *testing.T) {
 
 			var wg sync.WaitGroup
 
-			testCh := make(chan NotificationEvent[TestPayload], 1)
+			testCh := make(chan *NotificationEvent[TestPayload], 1)
 
 			driver := &MockDriver[TestPayload]{
 				WG: &wg,
-				ListenFunc: func(ctx context.Context) (<-chan NotificationEvent[TestPayload], error) {
+				ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
 					return testCh, nil
 				},
 			}
@@ -210,7 +225,7 @@ func TestEngine(t *testing.T) {
 			}
 
 			dlh := &MockDeadLetter[TestPayload]{
-				HandleFunc: func(ev NotificationEvent[TestPayload], finalErr error) error {
+				HandleFunc: func(ev *NotificationEvent[TestPayload], finalErr error) error {
 					return finalErr
 				},
 			}
@@ -227,7 +242,7 @@ func TestEngine(t *testing.T) {
 
 			wg.Add(1)
 
-			testCh <- tc.inputEvent
+			testCh <- &tc.inputEvent
 
 			wg.Wait()
 
@@ -272,11 +287,11 @@ func TestEngine_GracefulShutdown(t *testing.T) {
 		Attempt:   1,
 	}
 
-	testCh := make(chan NotificationEvent[TestPayload], 1)
+	testCh := make(chan *NotificationEvent[TestPayload], 1)
 	startedProcessing := make(chan struct{})
 
 	driver := &MockDriver[TestPayload]{
-		ListenFunc: func(ctx context.Context) (<-chan NotificationEvent[TestPayload], error) {
+		ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
 			var once sync.Once
 			go func() {
 				<-ctx.Done()
@@ -298,7 +313,7 @@ func TestEngine_GracefulShutdown(t *testing.T) {
 	}
 
 	dlh := &MockDeadLetter[TestPayload]{
-		HandleFunc: func(ev NotificationEvent[TestPayload], finalErr error) error {
+		HandleFunc: func(ev *NotificationEvent[TestPayload], finalErr error) error {
 			return finalErr
 		},
 	}
@@ -313,7 +328,7 @@ func TestEngine_GracefulShutdown(t *testing.T) {
 		engineErrors <- engine.Start(ctx)
 	}()
 
-	testCh <- inputEvent
+	testCh <- &inputEvent
 
 	<-startedProcessing
 
@@ -333,11 +348,11 @@ func TestEngine_DriverReconnection(t *testing.T) {
 	defer cancel()
 
 	reconnectSignal := make(chan struct{}, 1)
-	testCh := make(chan NotificationEvent[TestPayload], 1)
+	testCh := make(chan *NotificationEvent[TestPayload], 1)
 
 	callCount := 0
 	driver := &MockDriver[TestPayload]{
-		ListenFunc: func(ctx context.Context) (<-chan NotificationEvent[TestPayload], error) {
+		ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
 			callCount++
 			if callCount == 1 {
 				return nil, fmt.Errorf("initial connection failure")
