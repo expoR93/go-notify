@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -168,9 +169,10 @@ func TestEngine(t *testing.T) {
 				CreatedAt: time.Now(),
 				Attempt:   6,
 			},
-			providerErr: nil,
-			expectedAck: true,
-			expectedDLQ: true,
+			providerErr:  nil,
+			expectedAck:  false,
+			expectedNack: true,
+			expectedDLQ:  true,
 		},
 		{
 			name: "Provider Timeout - Trigger Transient Retry",
@@ -194,7 +196,7 @@ func TestEngine(t *testing.T) {
 				Attempt:   1,
 			},
 			providerErr: nil,
-			expectedAck: true, // Must Ack to remove from queue
+			expectedAck: false,
 			expectedDLQ: true, // Must reach DLQ for "History" tracking
 		},
 	}
@@ -372,5 +374,44 @@ func TestEngine_DriverReconnection(t *testing.T) {
 
 	case <-time.After(2 * time.Second):
 		t.Fatal("Engine failed to reconnect after initial driver error")
+	}
+}
+
+func TestEngine_DeadLetterHook_Reliability(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	inputEvent := NotificationEvent[TestPayload]{
+		EventID:   99,
+		Channel:   ChannelEmail,
+		Attempt:   6,
+		CreatedAt: time.Now(),
+		Metadata:  nil,
+	}
+
+	testCh := make(chan *NotificationEvent[TestPayload], 1)
+	driver := &MockDriver[TestPayload]{
+		ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
+			return testCh, nil
+		},
+	}
+
+	// This hook fails intentionally
+	dlh := &MockDeadLetter[TestPayload]{
+		HandleFunc: func(ev *NotificationEvent[TestPayload], finalErr error) error {
+			return errors.New("database connection lost")
+		},
+	}
+
+	engine, _ := NewEngine(driver, []Provider[TestPayload]{&MockProvider[TestPayload]{}}, 1, nil, dlh)
+
+	go engine.Start(ctx)
+	testCh <- &inputEvent
+
+	// Wait and verify
+	time.Sleep(100 * time.Millisecond)
+
+	if driver.NackCalls == 0 {
+		t.Error("Expected Nack when DeadLetterHook fails, but message was dropped/Acked")
 	}
 }

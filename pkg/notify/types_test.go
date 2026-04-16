@@ -21,8 +21,8 @@ func TestNewNotificationEvent(t *testing.T) {
 		t.Errorf("Expected sane timestamp, got %v instead", ev.CreatedAt)
 	}
 
-	if ev.Metadata == nil {
-		t.Error("Expected Metadata shouldn't be nil")
+	if ev.Metadata != nil {
+		t.Errorf("Expected Metadata to be nil for zero-allocation initialization, got %v", ev.Metadata)
 	}
 }
 

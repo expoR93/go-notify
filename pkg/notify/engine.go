@@ -145,6 +145,9 @@ func (e *Engine[T]) processEvent(ctx context.Context, event *NotificationEvent[T
 		if e.deadLetterHook != nil {
 			if err := e.deadLetterHook.Handle(event, ErrEventExpired); err != nil {
 				e.logger.Error("failed to execute dead letter hook for expired event", slog.String("error", err.Error()))
+
+				e.driver.Nack(event, e.calculateBackoff(event.Attempt))
+				return
 			}
 		}
 		e.driver.Ack(event.EventID)
@@ -162,6 +165,9 @@ func (e *Engine[T]) processEvent(ctx context.Context, event *NotificationEvent[T
 			// Persist the failure before we Ack
 			if err := e.deadLetterHook.Handle(event, ErrMaxRetries); err != nil {
 				e.logger.Error("failed to execute dead letter hook", slog.String("error", err.Error()))
+
+				e.driver.Nack(event, e.calculateBackoff(event.Attempt))
+				return
 			}
 		}
 		e.driver.Ack(event.EventID)
