@@ -46,7 +46,12 @@ func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int
 	for _, provider := range providers {
 		key := provider.Type()
 		if _, ok := registry[key]; !ok {
-			registry[key] = provider
+			registry[key] = &CircuitBreakerProvider[T]{
+				inner:     provider,
+				threshold: 5,
+				cooldown:  30 * time.Second,
+				state:     StateClosed,
+			}
 		} else {
 			return nil, errors.New("Only one Provider per type is currently supported")
 		}
@@ -65,8 +70,35 @@ func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int
 	}, nil
 }
 
+func (e *Engine[T]) monitorProviders(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for name, p := range e.providers {
+				// Proactively check if the service is up
+				if err := p.Ping(ctx); err != nil {
+					if e.logger.Enabled(ctx, slog.LevelWarn) {
+						e.logger.Warn("provider health check failed",
+							slog.String("provider", name),
+							slog.String("error", err.Error()),
+						)
+					}
+				}
+			}
+		}
+	}
+}
+
 func (e *Engine[T]) Start(ctx context.Context) error {
 	e.startTime = time.Now()
+
+	go e.monitorProviders(ctx)
+
 	reconnectAttempt := 0
 
 	for {

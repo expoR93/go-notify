@@ -14,6 +14,7 @@ type Driver[T any] interface {
 type Provider[T any] interface {
 	Send(ctx context.Context, event *NotificationEvent[T]) error
 	Type() string // "email", "sms"...
+	Ping(ctx context.Context) error
 }
 
 type DeadLetterHook[T any] interface {

@@ -1,7 +1,9 @@
 package notify
 
 import (
+	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/sony/sonyflake"
@@ -29,6 +31,7 @@ var (
 	errEventChannelEmpty    = errors.New("event_channel cannot be empty")
 	errEventCreatedAtZero   = errors.New("event_createdat cannot be zero")
 	errEventCreatedAtFuture = errors.New("event_createdat cannot be further in the future (5s+), potential serialization error or a severely de-synchronized clock")
+	ErrCircuitOpen          = errors.New("circuit breaker is open")
 )
 
 type ValidationError struct {
@@ -141,4 +144,104 @@ func (m *Manager[T]) CreateEvent(channel ChannelType, payload T) (NotificationEv
 	}
 
 	return newNotificationEvent(id, channel, payload), nil
+}
+
+type CircuitState int
+
+const (
+	StateClosed CircuitState = iota
+	StateOpen
+	StateHalfOpen
+)
+
+// CircuitBreakerProvider wraps a standard Provider to add fault tolerance.
+type CircuitBreakerProvider[T any] struct {
+	inner           Provider[T]
+	mu              sync.RWMutex
+	state           CircuitState
+	failures        int
+	threshold       int
+	cooldown        time.Duration
+	lastFailureTime time.Time
+}
+
+func (cb *CircuitBreakerProvider[T]) Send(ctx context.Context, event *NotificationEvent[T]) error {
+	if !cb.allowRequest() {
+		return &ProviderError{
+			Err:  ErrCircuitOpen,
+			Type: ErrorTransient,
+		}
+	}
+
+	err := cb.inner.Send(ctx, event)
+	cb.recordResult(err)
+	return err
+}
+
+func (cb *CircuitBreakerProvider[T]) Ping(ctx context.Context) error {
+	err := cb.inner.Ping(ctx)
+
+	if err == nil {
+		cb.mu.Lock()
+		cb.state = StateClosed
+		cb.failures = 0
+		cb.mu.Unlock()
+	}
+	return err
+}
+
+func (cb *CircuitBreakerProvider[T]) allowRequest() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	if cb.state == StateClosed {
+		return true
+	}
+
+	if cb.state == StateOpen {
+		if time.Since(cb.lastFailureTime) > cb.cooldown {
+			cb.state = StateHalfOpen
+			return true // This first worker is the "probe"
+		}
+		return false // Cooldown hasn't passed yet
+	}
+
+	// If we are already in StateHalfOpen, block all other workers
+	// until the "probe" worker calls recordResult.
+	if cb.state == StateHalfOpen {
+		return false
+	}
+
+	return false
+}
+
+func (cb *CircuitBreakerProvider[T]) recordResult(err error) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if err == nil {
+		cb.state = StateClosed
+		cb.failures = 0
+		return
+	}
+
+	var provErr *ProviderError
+	if errors.As(err, &provErr) && provErr.Type == ErrorTransient {
+		// If the probe failed during Half-Open, immediately re-open the circuit
+		if cb.state == StateHalfOpen {
+			cb.state = StateOpen
+			cb.lastFailureTime = time.Now()
+			return
+		}
+
+		cb.failures++
+		cb.lastFailureTime = time.Now()
+		if cb.failures >= cb.threshold {
+			cb.state = StateOpen
+		}
+	}
+}
+
+func (cb *CircuitBreakerProvider[T]) Type() string {
+	return cb.inner.Type()
 }

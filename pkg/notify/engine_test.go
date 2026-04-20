@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -12,6 +14,7 @@ import (
 type MockProvider[T any] struct {
 	SendFunc func(ctx context.Context, event NotificationEvent[T]) error
 	TypeFunc func() string
+	PingFunc func(ctx context.Context) error
 }
 
 func (m *MockProvider[T]) Send(ctx context.Context, event *NotificationEvent[T]) error {
@@ -28,6 +31,13 @@ func (m *MockProvider[T]) Type() string {
 	}
 
 	return "mock"
+}
+
+func (m *MockProvider[T]) Ping(ctx context.Context) error {
+	if m.PingFunc != nil {
+		return m.PingFunc(ctx)
+	}
+	return nil
 }
 
 type MockDriver[T any] struct {
@@ -213,6 +223,9 @@ func TestEngine(t *testing.T) {
 			driver := &MockDriver[TestPayload]{
 				WG: &wg,
 				ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
 					return testCh, nil
 				},
 			}
@@ -248,7 +261,6 @@ func TestEngine(t *testing.T) {
 
 			wg.Wait()
 
-			close(testCh)
 			cancel()
 
 			if tc.expectedAck && driver.AckCalls == 0 {
@@ -392,6 +404,9 @@ func TestEngine_DeadLetterHook_Reliability(t *testing.T) {
 	testCh := make(chan *NotificationEvent[TestPayload], 1)
 	driver := &MockDriver[TestPayload]{
 		ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return testCh, nil
 		},
 	}
@@ -413,5 +428,104 @@ func TestEngine_DeadLetterHook_Reliability(t *testing.T) {
 
 	if driver.NackCalls == 0 {
 		t.Error("Expected Nack when DeadLetterHook fails, but message was dropped/Acked")
+	}
+}
+
+func TestEngine_CircuitBreaker_Integration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	failCount := 0
+	provider := &MockProvider[TestPayload]{
+		TypeFunc: func() string { return string(ChannelEmail) },
+		SendFunc: func(ctx context.Context, event NotificationEvent[TestPayload]) error {
+			failCount++
+			return &ProviderError{Err: errors.New("network fail"), Type: ErrorTransient}
+		},
+	}
+
+	testCh := make(chan *NotificationEvent[TestPayload], 10)
+	driver := &MockDriver[TestPayload]{
+		ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return testCh, nil
+		},
+	}
+
+	engine, _ := NewEngine(driver, []Provider[TestPayload]{provider}, 1, nil, nil)
+	go engine.Start(ctx)
+
+	for i := 0; i < 5; i++ {
+		testCh <- &NotificationEvent[TestPayload]{
+			EventID: uint64(i + 1), Channel: ChannelEmail, Attempt: 1, CreatedAt: time.Now(),
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if failCount > 5 {
+		t.Errorf("Circuit failed to trip; provider called %d times", failCount)
+	}
+}
+
+func TestEngine_CircuitBreaker_StrictHalfOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cooldown := 500 * time.Millisecond
+
+	// Track how many times the provider was actually called
+	var callCount atomic.Int32
+	provider := &MockProvider[TestPayload]{
+		TypeFunc: func() string { return string(ChannelEmail) },
+		SendFunc: func(ctx context.Context, event NotificationEvent[TestPayload]) error {
+			callCount.Add(1)
+			// Simulate a slow network call so other workers have time to arrive
+			time.Sleep(100 * time.Millisecond)
+			return &ProviderError{Err: errors.New("still down"), Type: ErrorTransient}
+		},
+	}
+
+	testCh := make(chan *NotificationEvent[TestPayload], 10)
+	driver := &MockDriver[TestPayload]{
+		ListenFunc: func(ctx context.Context) (<-chan *NotificationEvent[TestPayload], error) {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return testCh, nil
+		},
+		NackFunc: func(event NotificationEvent[TestPayload], delay time.Duration) error { return nil },
+	}
+
+	// Manual setup to control cooldown exactly
+	registry := map[string]Provider[TestPayload]{
+		string(ChannelEmail): &CircuitBreakerProvider[TestPayload]{
+			inner:           provider,
+			threshold:       1, // Trip immediately
+			cooldown:        cooldown,
+			state:           StateOpen,
+			lastFailureTime: time.Now().Add(-cooldown - time.Second), // Force it to be "expired"
+		},
+	}
+
+	engine := &Engine[TestPayload]{
+		driver:      driver,
+		providers:   registry,
+		workerCount: 1,
+		logger:      slog.Default(),
+	}
+
+	for i := 0; i < 5; i++ {
+		testCh <- &NotificationEvent[TestPayload]{EventID: uint64(i + 1), Channel: ChannelEmail, Attempt: 1, CreatedAt: time.Now()}
+	}
+
+	go engine.Start(ctx)
+
+	time.Sleep(500 * time.Millisecond)
+
+	if callCount.Load() != 1 {
+		t.Errorf("Strict Half-Open failed: expected 1 provider call, got %d", callCount.Load())
 	}
 }
