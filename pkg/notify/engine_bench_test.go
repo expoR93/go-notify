@@ -74,7 +74,7 @@ func BenchmarkEngine_SaturationRecovery(b *testing.B) {
 	events := make([]*NotificationEvent[TestPayload], batchSize)
 	for j := 0; j < batchSize; j++ {
 		ev := &NotificationEvent[TestPayload]{ // Create as pointer
-			EventID:   uint64(j),
+			EventID:   uint64(j + 1),
 			Channel:   ChannelEmail,
 			CreatedAt: time.Now(),
 			Attempt:   1,

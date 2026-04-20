@@ -112,7 +112,7 @@ func TestValidateEvent(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.inputEvent.Validate()
+		err := tc.inputEvent.Validate(time.Now())
 
 			if tc.expectedError != "" && err == nil {
 				t.Errorf("expected error %q, but got nil", tc.expectedError)

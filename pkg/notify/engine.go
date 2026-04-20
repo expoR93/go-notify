@@ -123,7 +123,8 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 }
 
 func (e *Engine[T]) processEvent(ctx context.Context, event *NotificationEvent[T]) {
-	if err := event.Validate(); err != nil {
+	now := time.Now()
+	if err := event.Validate(now); err != nil {
 		if e.logger.Enabled(ctx, slog.LevelError) {
 			e.logger.Error("notification_event validation failed",
 				slog.Uint64("event_id", event.EventID),
@@ -193,7 +194,6 @@ func (e *Engine[T]) processEvent(ctx context.Context, event *NotificationEvent[T
 	if err := provider.Send(ctx, event); err != nil {
 		var provErr *ProviderError
 
-		// Handle Permanent Failures (Invalid API Key, Bad Request, etc.)
 		if errors.As(err, &provErr) && provErr.Type == ErrorPermanent {
 			if e.logger.Enabled(ctx, slog.LevelError) {
 				e.logger.Error("permanent provider failure: dropping message",

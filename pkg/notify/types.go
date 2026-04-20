@@ -23,6 +23,14 @@ const (
 	ErrorInvalidData
 )
 
+var (
+	errEventIDZero          = errors.New("event_id cannot be zero")
+	errEventAttemptZero     = errors.New("event_attempt cannot be zero")
+	errEventChannelEmpty    = errors.New("event_channel cannot be empty")
+	errEventCreatedAtZero   = errors.New("event_createdat cannot be zero")
+	errEventCreatedAtFuture = errors.New("event_createdat cannot be further in the future (5s+), potential serialization error or a severely de-synchronized clock")
+)
+
 type ValidationError struct {
 	Err  error
 	Type ErrorType
@@ -56,34 +64,34 @@ type NotificationEvent[T any] struct {
 	Payload   T                 `json:"payload"`
 }
 
-func (e *NotificationEvent[T]) Validate() error {
+func (e *NotificationEvent[T]) Validate(now time.Time) error {
 	if e.EventID == 0 {
 		return &ValidationError{
-			Err:  errors.New("event_id cannot be zero"),
+			Err:  errEventIDZero,
 			Type: ErrorInvalidData,
 		}
 	}
 	if e.Attempt == 0 {
 		return &ValidationError{
-			Err:  errors.New("event_attempt cannot be zero"),
+			Err:  errEventAttemptZero,
 			Type: ErrorInvalidData,
 		}
 	}
 	if e.Channel == "" {
 		return &ValidationError{
-			Err:  errors.New("event_channel cannot be empty"),
+			Err:  errEventChannelEmpty,
 			Type: ErrorInvalidData,
 		}
 	}
 	if e.CreatedAt.IsZero() {
 		return &ValidationError{
-			Err:  errors.New("event_createdat cannot be zero"),
+			Err:  errEventCreatedAtZero,
 			Type: ErrorInvalidData,
 		}
 	}
-	if e.CreatedAt.After(time.Now().Add(5 * time.Second)) {
+	if e.CreatedAt.After(now.Add(5 * time.Second)) {
 		return &ValidationError{
-			Err:  errors.New("event_createdat cannot be further in the future (5s+), potential serialization error or a severely de-synchronized clock"),
+			Err:  errEventCreatedAtFuture,
 			Type: ErrorInvalidData,
 		}
 	}
