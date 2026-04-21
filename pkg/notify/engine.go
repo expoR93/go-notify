@@ -26,6 +26,8 @@ type Engine[T any] struct {
 	startTime      time.Time
 	logger         *slog.Logger
 	deadLetterHook DeadLetterHook[T]
+	middlewares    []Middleware[T]
+	handler        Handler[T]
 }
 
 func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int, logger *slog.Logger, dlh DeadLetterHook[T]) (*Engine[T], error) {
@@ -61,13 +63,21 @@ func NewEngine[T any](driver Driver[T], providers []Provider[T], workerCount int
 		logger = slog.Default()
 	}
 
-	return &Engine[T]{
+	engine := &Engine[T]{
 		driver:         driver,
 		providers:      registry,
 		workerCount:    workerCount,
 		logger:         logger,
 		deadLetterHook: dlh,
-	}, nil
+		middlewares:    make([]Middleware[T], 0),
+	}
+
+	// Initialize the event handler with recovery middleware by default
+	baseHandler := engine.createBaseHandler()
+	recoveryMW := RecoveryMiddleware[T](logger)
+	engine.handler = recoveryMW(baseHandler)
+
+	return engine, nil
 }
 
 func (e *Engine[T]) monitorProviders(ctx context.Context) {
@@ -96,6 +106,13 @@ func (e *Engine[T]) monitorProviders(ctx context.Context) {
 
 func (e *Engine[T]) Start(ctx context.Context) error {
 	e.startTime = time.Now()
+
+	// Ensure handler is initialized (for cases where Engine is created directly without NewEngine)
+	if e.handler == nil {
+		baseHandler := e.createBaseHandler()
+		recoveryMW := RecoveryMiddleware[T](e.logger)
+		e.handler = recoveryMW(baseHandler)
+	}
 
 	go e.monitorProviders(ctx)
 
@@ -137,7 +154,7 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 			go func() {
 				defer wg.Done()
 				for event := range events {
-					e.processEvent(ctx, event)
+					e.handler(ctx, event)
 				}
 			}()
 		}
@@ -154,119 +171,143 @@ func (e *Engine[T]) Start(ctx context.Context) error {
 	}
 }
 
-func (e *Engine[T]) processEvent(ctx context.Context, event *NotificationEvent[T]) {
-	now := time.Now()
-	if err := event.Validate(now); err != nil {
-		if e.logger.Enabled(ctx, slog.LevelError) {
-			e.logger.Error("notification_event validation failed",
-				slog.Uint64("event_id", event.EventID),
-				slog.String("error", err.Error()),
-			)
-		}
-		e.driver.Ack(event.EventID)
-		return
-	}
+// UseMiddleware registers one or more middleware functions with the engine.
+// Middleware is applied in order, wrapping the base handler.
+// This must be called before Start() to have effect on event processing.
+func (e *Engine[T]) UseMiddleware(middlewares ...Middleware[T]) {
+	e.middlewares = append(e.middlewares, middlewares...)
+	// Recompose the handler with updated middleware
+	baseHandler := e.createBaseHandler()
+	recoveryMW := RecoveryMiddleware[T](e.logger)
+	allMW := append([]Middleware[T]{recoveryMW}, e.middlewares...)
+	composedMW := Chain(allMW...)
+	e.handler = composedMW(baseHandler)
+}
 
-	if event.IsExpired() {
-		if e.logger.Enabled(ctx, slog.LevelWarn) {
-			e.logger.Warn("notification expired, routing to dead letter",
-				slog.Uint64("event_id", event.EventID),
-				slog.Time("expired_at", event.ExpiresAt),
-			)
-		}
+// Handle processes a single notification event through the middleware chain and handler.
+// This is primarily used for testing and direct event processing outside of Start().
+func (e *Engine[T]) Handle(ctx context.Context, event *NotificationEvent[T]) error {
+	return e.handler(ctx, event)
+}
 
-		if e.deadLetterHook != nil {
-			if err := e.deadLetterHook.Handle(event, ErrEventExpired); err != nil {
-				e.logger.Error("failed to execute dead letter hook for expired event", slog.String("error", err.Error()))
-
-				e.driver.Nack(event, e.calculateBackoff(event.Attempt))
-				return
-			}
-		}
-		e.driver.Ack(event.EventID)
-		return
-	}
-
-	if event.Attempt > MaxRetries {
-		if e.logger.Enabled(ctx, slog.LevelWarn) {
-			e.logger.Warn("max retries reached",
-				slog.Uint64("event_id", event.EventID),
-				slog.Int("attempts", event.Attempt))
-		}
-
-		if e.deadLetterHook != nil {
-			// Persist the failure before we Ack
-			if err := e.deadLetterHook.Handle(event, ErrMaxRetries); err != nil {
-				e.logger.Error("failed to execute dead letter hook", slog.String("error", err.Error()))
-
-				e.driver.Nack(event, e.calculateBackoff(event.Attempt))
-				return
-			}
-		}
-		e.driver.Ack(event.EventID)
-		return
-	}
-
-	targetChannel := string(event.Channel)
-
-	provider, exists := e.providers[targetChannel]
-	if !exists {
-		if e.logger.Enabled(ctx, slog.LevelError) {
-			e.logger.Error("routing failed: no provider registered for channel",
-				slog.String("channel", targetChannel),
-				slog.Uint64("event_id", event.EventID),
-				slog.String("suggestion", "check NewEngine provider slice initialization"),
-			)
-		}
-
-		e.driver.Ack(event.EventID)
-		return
-	}
-
-	if err := provider.Send(ctx, event); err != nil {
-		var provErr *ProviderError
-
-		if errors.As(err, &provErr) && provErr.Type == ErrorPermanent {
+// createBaseHandler creates the core event processing handler without middleware.
+// This is the innermost handler that performs the actual notification delivery logic.
+func (e *Engine[T]) createBaseHandler() Handler[T] {
+	return func(ctx context.Context, event *NotificationEvent[T]) error {
+		now := time.Now()
+		if err := event.Validate(now); err != nil {
 			if e.logger.Enabled(ctx, slog.LevelError) {
-				e.logger.Error("permanent provider failure: dropping message",
+				e.logger.Error("notification_event validation failed",
 					slog.Uint64("event_id", event.EventID),
-					slog.String("channel", string(event.Channel)),
 					slog.String("error", err.Error()),
+				)
+			}
+			e.driver.Ack(event.EventID)
+			return nil
+		}
+
+		if event.IsExpired() {
+			if e.logger.Enabled(ctx, slog.LevelWarn) {
+				e.logger.Warn("notification expired, routing to dead letter",
+					slog.Uint64("event_id", event.EventID),
+					slog.Time("expired_at", event.ExpiresAt),
+				)
+			}
+
+			if e.deadLetterHook != nil {
+				if err := e.deadLetterHook.Handle(event, ErrEventExpired); err != nil {
+					e.logger.Error("failed to execute dead letter hook for expired event", slog.String("error", err.Error()))
+
+					e.driver.Nack(event, e.calculateBackoff(event.Attempt))
+					return nil
+				}
+			}
+			e.driver.Ack(event.EventID)
+			return nil
+		}
+
+		if event.Attempt > MaxRetries {
+			if e.logger.Enabled(ctx, slog.LevelWarn) {
+				e.logger.Warn("max retries reached",
+					slog.Uint64("event_id", event.EventID),
+					slog.Int("attempts", event.Attempt))
+			}
+
+			if e.deadLetterHook != nil {
+				// Persist the failure before we Ack
+				if err := e.deadLetterHook.Handle(event, ErrMaxRetries); err != nil {
+					e.logger.Error("failed to execute dead letter hook", slog.String("error", err.Error()))
+
+					e.driver.Nack(event, e.calculateBackoff(event.Attempt))
+					return nil
+				}
+			}
+			e.driver.Ack(event.EventID)
+			return nil
+		}
+
+		targetChannel := string(event.Channel)
+
+		provider, exists := e.providers[targetChannel]
+		if !exists {
+			if e.logger.Enabled(ctx, slog.LevelError) {
+				e.logger.Error("routing failed: no provider registered for channel",
+					slog.String("channel", targetChannel),
+					slog.Uint64("event_id", event.EventID),
+					slog.String("suggestion", "check NewEngine provider slice initialization"),
 				)
 			}
 
 			e.driver.Ack(event.EventID)
-			return
+			return nil
 		}
 
-		// Handle Transient Failures (Network timeout, 500 Internal Error, etc.)
-		jitter := time.Duration(rand.Intn(100)) * time.Millisecond
-		delay := e.calculateBackoff(event.Attempt) + jitter
+		if err := provider.Send(ctx, event); err != nil {
+			var provErr *ProviderError
 
-		event.Attempt++
+			if errors.As(err, &provErr) && provErr.Type == ErrorPermanent {
+				if e.logger.Enabled(ctx, slog.LevelError) {
+					e.logger.Error("permanent provider failure: dropping message",
+						slog.Uint64("event_id", event.EventID),
+						slog.String("channel", string(event.Channel)),
+						slog.String("error", err.Error()),
+					)
+				}
 
-		if e.logger.Enabled(ctx, slog.LevelWarn) {
-			e.logger.Warn("transient provider failure: scheduling retry",
+				e.driver.Ack(event.EventID)
+				return nil
+			}
+
+			// Handle Transient Failures (Network timeout, 500 Internal Error, etc.)
+			jitter := time.Duration(rand.Intn(100)) * time.Millisecond
+			delay := e.calculateBackoff(event.Attempt) + jitter
+
+			event.Attempt++
+
+			if e.logger.Enabled(ctx, slog.LevelWarn) {
+				e.logger.Warn("transient provider failure: scheduling retry",
+					slog.Uint64("event_id", event.EventID),
+					slog.Int("attempt", event.Attempt),
+					slog.Duration("backoff_delay", delay),
+					slog.String("error", err.Error()),
+				)
+			}
+
+			e.driver.Nack(event, delay)
+			return nil
+		}
+
+		if e.logger.Enabled(ctx, slog.LevelInfo) {
+			e.logger.Info("notification sent successfully",
 				slog.Uint64("event_id", event.EventID),
-				slog.Int("attempt", event.Attempt),
-				slog.Duration("backoff_delay", delay),
-				slog.String("error", err.Error()),
+				slog.String("channel", string(event.Channel)),
+				slog.Duration("duration", time.Since(event.CreatedAt)), // Performance metric!
 			)
 		}
 
-		e.driver.Nack(event, delay)
-		return
+		e.driver.Ack(event.EventID)
+		return nil
 	}
-
-	if e.logger.Enabled(ctx, slog.LevelInfo) {
-		e.logger.Info("notification sent successfully",
-			slog.Uint64("event_id", event.EventID),
-			slog.String("channel", string(event.Channel)),
-			slog.Duration("duration", time.Since(event.CreatedAt)), // Performance metric!
-		)
-	}
-
-	e.driver.Ack(event.EventID)
 }
 
 func (e *Engine[T]) calculateBackoff(attempt int) time.Duration {
